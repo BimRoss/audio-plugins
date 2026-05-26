@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build / dist
+build/
+dist/
+
+# Editors
+.idea/
+.vscode/
+.DS_Store
+
+# Audio working data — never commit raw samples or generated output
+piano-sampler/audio-in/
+piano-sampler/audio-out/
+*.wav
+*.aif
+*.aiff
+*.flac
+
+# Kontakt artifacts (binary, big)
+*.nki
+*.nkm
+*.nkr
+*.nkc
