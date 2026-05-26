@@ -10,14 +10,11 @@ requires-python = ">=3.11"
 authors = [{ name = "Ross", email = "ross@bimross.com" }]
 license = { text = "MIT" }
 dependencies = [
-    "soundfile>=0.12",
     "numpy>=1.26",
-    "librosa>=0.10",
     "click>=8.1",
 ]
 
 [project.optional-dependencies]
-crepe = ["crepe>=0.0.13", "tensorflow>=2.15"]
 dev = ["pytest>=8", "ruff>=0.4"]
 
 [project.scripts]
