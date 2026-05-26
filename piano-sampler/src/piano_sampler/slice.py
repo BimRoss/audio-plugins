@@ -23,12 +23,15 @@ class Slice:
 class SliceConfig:
     frame_size: int = 1024  # samples per analysis frame
     hop: int = 256  # frame hop (analysis stride)
-    onset_margin_db: float = 12.0  # frame RMS must exceed (noise_floor + margin) to count as onset
-    onset_min_gap_seconds: float = 0.25  # minimum spacing between accepted onsets
-    onset_lookback_seconds: float = 0.02  # snap the onset back to start of rise
+    onset_jump_db: float = 18.0  # current frame RMS must exceed past-window RMS by this much
+    onset_abs_margin_db: float = 12.0  # absolute floor: rms must also exceed noise_floor + this
+    onset_lookback_seconds: float = 0.20  # how far back the comparison window starts
+    onset_window_seconds: float = 0.10  # length of the past-comparison window
+    onset_min_gap_seconds: float = 2.0  # minimum spacing between accepted onsets
+    onset_snap_back_seconds: float = 0.02  # capture pre-attack air on the slice start
     trim_margin_db: float = 6.0  # trailing-silence threshold above noise floor
     trim_min_silence_seconds: float = 0.3  # silence duration to confirm "end of note"
-    noise_floor_seconds: float = 1.0  # pre-roll used to measure noise floor
+    noise_floor_seconds: float = 1.0  # legacy; current measure_noise_floor uses percentile
 
 
 def to_mono(samples: np.ndarray) -> np.ndarray:
@@ -80,29 +83,47 @@ def find_onsets(
     noise_floor: float,
     cfg: SliceConfig,
 ) -> list[int]:
-    """Return sorted list of onset sample indices."""
+    """Detect note onsets as transient rises in frame RMS.
+
+    Each frame's RMS is compared to the mean RMS of a short past-window placed
+    `onset_lookback_seconds` ago. A frame is an onset when:
+
+      - rms[i] > k_jump * past_rms[i]   (sudden rise; piano attack)
+      - rms[i] > noise_floor * k_abs    (above pure-noise threshold)
+      - at least `onset_min_gap_seconds` since the previous accepted onset
+
+    This rejects sustained-but-not-attacking frames (note bodies, mechanical
+    noise mid-decay) and avoids splitting a single note into many onsets.
+    """
     rms = frame_rms(mono, cfg.frame_size, cfg.hop)
     if rms.size == 0:
         return []
-    threshold = noise_floor * (10 ** (cfg.onset_margin_db / 20.0))
-    above = rms > threshold
+
+    lookback_frames = max(1, int(cfg.onset_lookback_seconds * sample_rate / cfg.hop))
+    window_frames = max(1, int(cfg.onset_window_seconds * sample_rate / cfg.hop))
+    gap_frames = max(1, int(cfg.onset_min_gap_seconds * sample_rate / cfg.hop))
+    k_jump = 10 ** (cfg.onset_jump_db / 20.0)
+    k_abs = 10 ** (cfg.onset_abs_margin_db / 20.0)
+    abs_threshold = noise_floor * k_abs
+
+    # Past-window mean (frames [i - lookback - window, i - lookback)).
+    past = np.empty_like(rms)
+    for i in range(len(rms)):
+        lo = max(0, i - lookback_frames - window_frames)
+        hi = max(0, i - lookback_frames)
+        past[i] = float(rms[lo:hi].mean()) if hi - lo >= 2 else noise_floor
 
     onsets: list[int] = []
-    min_gap_frames = max(1, int(cfg.onset_min_gap_seconds * sample_rate / cfg.hop))
-    last_onset_frame = -min_gap_frames - 1
-    # If the file already starts above threshold, frame 0 is itself an onset.
-    if above[0]:
-        onsets.append(0)
-        last_onset_frame = 0
-    for i in range(1, len(above)):
-        if above[i] and not above[i - 1]:
-            if i - last_onset_frame >= min_gap_frames:
-                onsets.append(i)
-                last_onset_frame = i
+    last = -gap_frames - 1
+    for i in range(len(rms)):
+        if rms[i] < abs_threshold:
+            continue
+        if rms[i] > k_jump * past[i] and (i - last) >= gap_frames:
+            onsets.append(i)
+            last = i
 
-    # Convert frame indices -> sample indices, snap back by lookback to capture pre-attack air.
-    lookback = int(cfg.onset_lookback_seconds * sample_rate)
-    return [max(0, idx * cfg.hop - lookback) for idx in onsets]
+    snap = int(cfg.onset_snap_back_seconds * sample_rate)
+    return [max(0, idx * cfg.hop - snap) for idx in onsets]
 
 
 def trim_trailing_silence(

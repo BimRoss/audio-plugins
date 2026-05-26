@@ -21,11 +21,12 @@ from .notes import PIANO_HIGHEST, PIANO_LOWEST, freq_to_midi, midi_to_freq
 
 @dataclass
 class PitchConfig:
-    analysis_offset_seconds: float = 0.05  # skip past hammer transient
-    analysis_window_seconds: float = 0.30  # length of pitch-analysis window
+    analysis_offset_seconds: float = 0.02  # skip past hammer transient
+    analysis_window_seconds: float = 0.40  # length of pitch-analysis window
     min_freq_hz: float = 25.0  # A0 = 27.5 Hz, give a hair of margin below
     max_freq_hz: float = 4500.0  # C8 = 4186 Hz
     tolerance_cents: float = 50.0  # how far a detected pitch may sit from a MIDI note
+    subharmonic_check_ratio: float = 0.7  # if peak at 2x lag has at least 0.7 * peak height, prefer 2x lag (octave-down fundamental)
 
 
 def estimate_pitch_hz(
@@ -37,10 +38,29 @@ def estimate_pitch_hz(
     cfg = cfg or PitchConfig()
     offset = int(cfg.analysis_offset_seconds * sample_rate)
     window = int(cfg.analysis_window_seconds * sample_rate)
-    if mono_slice.size <= offset + window:
-        seg = mono_slice[offset:] if mono_slice.size > offset else mono_slice
+    # Find the highest-RMS sub-window of length `window` within the slice
+    # starting at `offset`. This places the analysis window on the strongest
+    # part of the note's body (essential for staccato samples where the body
+    # is short and pitch dies before the slice ends).
+    seg_end = mono_slice.size
+    if seg_end <= offset + 256:
+        return None
+    if seg_end - offset <= window:
+        seg = mono_slice[offset:seg_end]
     else:
-        seg = mono_slice[offset : offset + window]
+        # Scan in window/4 steps for the highest-RMS sub-window.
+        step = max(1, window // 4)
+        best_start = offset
+        best_rms = -1.0
+        s = offset
+        while s + window <= seg_end:
+            chunk = mono_slice[s : s + window]
+            r = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2) + 1e-20))
+            if r > best_rms:
+                best_rms = r
+                best_start = s
+            s += step
+        seg = mono_slice[best_start : best_start + window]
     if seg.size < 256:
         return None
 
@@ -67,25 +87,24 @@ def estimate_pitch_hz(
     if max_lag <= min_lag + 1:
         return None
 
-    # Find the first local maximum in [min_lag, max_lag] that's strong enough.
-    # We scan for ANY local maximum (ac[i] > ac[i-1] and ac[i] > ac[i+1]) above
-    # 0.2 normalized correlation. This works across the whole keyboard:
-    # at low frequencies the central lobe is wide so the first real peak is
-    # well past min_lag; at high frequencies min_lag itself can be near the
-    # first peak.
-    best_peak = -1
-    best_corr = 0.2  # confidence floor
+    # Find ALL local maxima in [min_lag, max_lag] with normalized correlation
+    # above a confidence floor. For piano, the fundamental is not always the
+    # tallest peak — upper partials often dominate, especially mid-decay in
+    # the bass. We pick the LARGEST-lag (lowest-frequency) candidate whose
+    # height is at least subharmonic_check_ratio * tallest_peak. This biases
+    # toward the true fundamental and avoids octave-error.
+    floor = 0.2
+    peaks: list[tuple[int, float]] = []
     for i in range(min_lag, max_lag):
-        if ac[i] > ac[i - 1] and ac[i] > ac[i + 1] and ac[i] > best_corr:
-            best_peak = i
-            best_corr = ac[i]
-            # First strong local max wins — short-circuit to favor the
-            # smallest-lag (highest-frequency) period, since later peaks are
-            # integer multiples (sub-octave doublings).
-            break
-    if best_peak < 0:
+        if ac[i] > ac[i - 1] and ac[i] > ac[i + 1] and ac[i] > floor:
+            peaks.append((i, float(ac[i])))
+    if not peaks:
         return None
-    peak = best_peak
+    tallest_height = max(h for _, h in peaks)
+    candidate_floor = cfg.subharmonic_check_ratio * tallest_height
+    # Pick the largest lag whose height clears the candidate floor.
+    qualifying = [(lag, h) for lag, h in peaks if h >= candidate_floor]
+    peak = max(lag for lag, _ in qualifying)
 
     # Parabolic interpolation around the peak for sub-sample lag.
     if 1 <= peak < ac.size - 1:
