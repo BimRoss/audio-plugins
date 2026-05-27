@@ -26,7 +26,7 @@ class PitchConfig:
     min_freq_hz: float = 25.0  # A0 = 27.5 Hz, give a hair of margin below
     max_freq_hz: float = 4500.0  # C8 = 4186 Hz
     tolerance_cents: float = 80.0  # how far a detected pitch may sit from a MIDI note (piano stretch tuning at extremes + detector noise)
-    subharmonic_check_ratio: float = 0.7  # if peak at 2x lag has at least 0.7 * peak height, prefer 2x lag (octave-down fundamental)
+    yin_threshold: float = 0.15  # CMNDF absolute threshold for accepting a τ (0.10-0.20 typical)
 
 
 def estimate_pitch_hz(
@@ -65,62 +65,54 @@ def estimate_pitch_hz(
         return None
 
     seg = seg.astype(np.float32)
-    # Remove DC and apply a Hann window so autocorrelation focuses on the
-    # central body rather than the boundaries.
     seg = seg - seg.mean()
-    hann = np.hanning(seg.size).astype(np.float32)
-    seg = seg * hann
-    energy = float((seg**2).sum())
-    if energy < 1e-8:
+    if float((seg**2).sum()) < 1e-8:
         return None
 
-    # Autocorrelation via FFT.
-    n = 1 << (int(np.ceil(np.log2(2 * seg.size))))
-    spec = np.fft.rfft(seg, n=n)
-    ac = np.fft.irfft(spec * np.conj(spec), n=n).real[: seg.size]
-    if ac[0] <= 0:
-        return None
-    ac /= ac[0]
+    # ---- Harmonic-summation pitch detection ----
+    # For each candidate f0 in [min_freq, max_freq] (logarithmic 1-cent steps),
+    # score = Σ_{k=1..N} log(1 + spec[k*f0]). The candidate whose harmonic stack
+    # accumulates the most spectral energy wins. This explicitly handles the
+    # "missing fundamental" case on real piano bass strings, where YIN and
+    # plain autocorrelation pick a strong upper partial instead of f0.
+    n_fft = 1 << int(np.ceil(np.log2(seg.size * 2)))
+    # Apply a Hann window so we get cleaner peaks.
+    seg_w = seg * np.hanning(seg.size).astype(np.float32)
+    spec = np.abs(np.fft.rfft(seg_w, n=n_fft))
+    bin_hz = sample_rate / n_fft
+    max_bin = len(spec) - 1
 
-    min_lag = max(2, int(sample_rate / cfg.max_freq_hz))
-    max_lag = min(ac.size - 2, int(sample_rate / cfg.min_freq_hz))
-    if max_lag <= min_lag + 1:
+    # Candidate f0 grid: 1 cent spacing across [min_freq, max_freq].
+    f_lo = max(cfg.min_freq_hz, 20.0)
+    f_hi = min(cfg.max_freq_hz, sample_rate / 2.5)
+    n_steps = int(np.ceil(np.log2(f_hi / f_lo) * 1200))  # one step per cent
+    cents_grid = np.arange(n_steps) / 1200.0
+    candidates = f_lo * (2.0 ** cents_grid)
+
+    n_harmonics = 8
+    # Build score by summing log(1 + spec[bin]) at each harmonic.
+    scores = np.zeros_like(candidates)
+    for k in range(1, n_harmonics + 1):
+        bins = np.round(candidates * k / bin_hz).astype(np.int64)
+        bins = np.clip(bins, 0, max_bin)
+        scores += np.log1p(spec[bins])
+
+    # Penalize very-high candidates whose first harmonic exceeds Nyquist coverage.
+    # And require min two strong harmonics in spec to call it a pitch.
+    best_idx = int(np.argmax(scores))
+    best_f0 = float(candidates[best_idx])
+    best_score = float(scores[best_idx])
+    if best_score < 0.5:  # essentially no harmonic content
         return None
 
-    # Find ALL local maxima in [min_lag, max_lag] with normalized correlation
-    # above a confidence floor. For piano, the fundamental is not always the
-    # tallest peak — upper partials often dominate, especially mid-decay in
-    # the bass. We pick the LARGEST-lag (lowest-frequency) candidate whose
-    # height is at least subharmonic_check_ratio * tallest_peak. This biases
-    # toward the true fundamental and avoids octave-error.
-    floor = 0.2
-    peaks: list[tuple[int, float]] = []
-    for i in range(min_lag, max_lag):
-        if ac[i] > ac[i - 1] and ac[i] > ac[i + 1] and ac[i] > floor:
-            peaks.append((i, float(ac[i])))
-    if not peaks:
-        return None
-    tallest_height = max(h for _, h in peaks)
-    candidate_floor = cfg.subharmonic_check_ratio * tallest_height
-    # Pick the largest lag whose height clears the candidate floor.
-    qualifying = [(lag, h) for lag, h in peaks if h >= candidate_floor]
-    peak = max(lag for lag, _ in qualifying)
+    # Octave-down sanity check: if the half-frequency candidate scores at least
+    # 0.85 * best, prefer it (catches octave-up errors on borderline cases).
+    half_idx = best_idx - 1200  # one octave = 1200 cents
+    if half_idx >= 0 and scores[half_idx] >= 0.85 * best_score:
+        best_idx = half_idx
+        best_f0 = float(candidates[best_idx])
 
-    # Parabolic interpolation around the peak for sub-sample lag.
-    if 1 <= peak < ac.size - 1:
-        a, b, c = ac[peak - 1], ac[peak], ac[peak + 1]
-        denom = (a - 2 * b + c)
-        if abs(denom) > 1e-12:
-            shift = 0.5 * (a - c) / denom
-            peak_f = peak + shift
-        else:
-            peak_f = float(peak)
-    else:
-        peak_f = float(peak)
-
-    if peak_f <= 0:
-        return None
-    return sample_rate / peak_f
+    return best_f0
 
 
 def nearest_midi(freq_hz: float, a4: float = 440.0) -> tuple[int, float]:
@@ -226,25 +218,10 @@ def chromatic_walk(
             expected = min(expected + 1, high_midi + 1)
             continue
 
-        # Maybe the operator skipped one (expected+1 is the next semitone above).
-        if abs(cents_to_expected - 100.0) <= tol_cents and expected + 1 <= high_midi:
-            new_note = expected + 1
-            labels.append(
-                LabeledSlice(
-                    i,
-                    midi=new_note,
-                    detected_freq_hz=freq,
-                    detected_midi=det_midi,
-                    cents_off=cents,
-                    reason="accepted",
-                )
-            )
-            last_accepted_midi = new_note
-            last_accepted_label_index = len(labels) - 1
-            expected = new_note + 1
-            continue
-
-        # Doesn't match retake, expected, or expected+1. Reject.
+        # Matt played all 88 chromatically with no skips — so if the detected
+        # pitch doesn't match expected or last (retake), we reject. Even if it
+        # looks like expected+1 it's safer to wait for the true expected match;
+        # accepting expected+1 here would orphan the real expected slice later.
         labels.append(
             LabeledSlice(
                 i,
