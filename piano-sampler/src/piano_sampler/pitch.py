@@ -25,7 +25,7 @@ class PitchConfig:
     analysis_window_seconds: float = 0.40  # length of pitch-analysis window
     min_freq_hz: float = 25.0  # A0 = 27.5 Hz, give a hair of margin below
     max_freq_hz: float = 4500.0  # C8 = 4186 Hz
-    tolerance_cents: float = 50.0  # how far a detected pitch may sit from a MIDI note
+    tolerance_cents: float = 80.0  # how far a detected pitch may sit from a MIDI note (piano stretch tuning at extremes + detector noise)
     subharmonic_check_ratio: float = 0.7  # if peak at 2x lag has at least 0.7 * peak height, prefer 2x lag (octave-down fundamental)
 
 
