@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .decentsampler import DSInstrumentSpec, write_dspreset
 from .edge_treatment import FadeConfig, apply_fades
 from .labeler import label_slices
 from .notes import midi_to_name
@@ -180,6 +181,16 @@ def build(
     )
     write_sfz(output_dir / f"{safe}_Sustain.sfz", sustain_spec)
     write_sfz(output_dir / f"{safe}_Staccato.sfz", staccato_spec)
+
+    # DecentSampler presets (free VST3/AU, no import step, no Kontakt needed).
+    write_dspreset(
+        output_dir / f"{safe}_Sustain.dspreset",
+        DSInstrumentSpec(name=f"{safe}_Sustain", regions=regions_by_artic["long"], release=1.2),
+    )
+    write_dspreset(
+        output_dir / f"{safe}_Staccato.dspreset",
+        DSInstrumentSpec(name=f"{safe}_Staccato", regions=regions_by_artic["short"], release=0.2),
+    )
 
     summary = _write_summary(output_dir, instrument_name, reports)
     return summary
