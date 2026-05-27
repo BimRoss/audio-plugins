@@ -10,8 +10,9 @@ from pathlib import Path
 import numpy as np
 
 from .edge_treatment import FadeConfig, apply_fades
+from .labeler import label_slices
 from .notes import midi_to_name
-from .pitch import PitchConfig, chromatic_walk, estimate_pitch_hz
+from .pitch import PitchConfig, score_midi_candidates
 from .sfz import InstrumentSpec, Region, write_sfz
 from .slice import SliceConfig, slice_file, to_mono
 from .wav_io import read_wav, write_wav
@@ -78,8 +79,8 @@ def _process_one(
     samples, sr, _bd = read_wav(inp.path)
     mono = to_mono(samples)
     slices, noise_floor = slice_file(samples, sr, slice_cfg)
-    freqs = [estimate_pitch_hz(mono[s.start : s.end], sr, pitch_cfg) for s in slices]
-    labels = chromatic_walk(freqs, cfg=pitch_cfg)
+    slice_scores = [score_midi_candidates(mono[s.start : s.end], sr, cfg=pitch_cfg) for s in slices]
+    labels = label_slices(slice_scores)
 
     written: list[str] = []
     regions: list[Region] = []

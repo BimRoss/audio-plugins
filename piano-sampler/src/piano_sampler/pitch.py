@@ -29,6 +29,86 @@ class PitchConfig:
     yin_threshold: float = 0.15  # CMNDF absolute threshold for accepting a τ (0.10-0.20 typical)
 
 
+def slice_spectrum(
+    mono_slice: np.ndarray,
+    sample_rate: int,
+    cfg: PitchConfig | None = None,
+) -> tuple[np.ndarray, float] | None:
+    """Return (magnitude spectrum, bin_hz) of the highest-RMS sub-window of the slice."""
+    cfg = cfg or PitchConfig()
+    offset = int(cfg.analysis_offset_seconds * sample_rate)
+    window = int(cfg.analysis_window_seconds * sample_rate)
+    seg_end = mono_slice.size
+    if seg_end <= offset + 256:
+        return None
+    if seg_end - offset <= window:
+        seg = mono_slice[offset:seg_end]
+    else:
+        step = max(1, window // 4)
+        best_start = offset
+        best_rms = -1.0
+        s = offset
+        while s + window <= seg_end:
+            chunk = mono_slice[s : s + window]
+            r = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2) + 1e-20))
+            if r > best_rms:
+                best_rms = r
+                best_start = s
+            s += step
+        seg = mono_slice[best_start : best_start + window]
+    if seg.size < 256:
+        return None
+    seg = seg.astype(np.float32)
+    seg = seg - seg.mean()
+    if float((seg**2).sum()) < 1e-8:
+        return None
+    n_fft = 1 << int(np.ceil(np.log2(seg.size * 2)))
+    seg_w = seg * np.hanning(seg.size).astype(np.float32)
+    spec = np.abs(np.fft.rfft(seg_w, n=n_fft))
+    bin_hz = sample_rate / n_fft
+    return spec, bin_hz
+
+
+def harmonic_score(spec: np.ndarray, bin_hz: float, freq_hz: float, n_harmonics: int = 6) -> float:
+    """Sum log-magnitudes at harmonics k*f0 for k=1..n. Higher = better fit for f0."""
+    max_bin = len(spec) - 1
+    score = 0.0
+    for k in range(1, n_harmonics + 1):
+        b = int(round(freq_hz * k / bin_hz))
+        if b > max_bin:
+            break
+        # Pick the peak within ±1 bin for robustness to bin quantization.
+        lo = max(0, b - 1)
+        hi = min(max_bin, b + 1)
+        score += float(np.log1p(spec[lo : hi + 1].max()))
+    return score
+
+
+def score_midi_candidates(
+    mono_slice: np.ndarray,
+    sample_rate: int,
+    *,
+    midi_range: tuple[int, int] = (21, 108),
+    cfg: PitchConfig | None = None,
+) -> dict[int, float] | None:
+    """Return {midi_note: harmonic_score} for every MIDI in the requested range.
+
+    This is the input to the DP labeler — the labeler picks the slice→note
+    assignment that maximizes total score subject to the monotonic A0..C8
+    constraint. Returning per-MIDI scores (instead of a single best f0) lets
+    the chromatic-order prior break octave ambiguity at assignment time.
+    """
+    res = slice_spectrum(mono_slice, sample_rate, cfg)
+    if res is None:
+        return None
+    spec, bin_hz = res
+    out: dict[int, float] = {}
+    for midi in range(midi_range[0], midi_range[1] + 1):
+        f0 = 440.0 * (2 ** ((midi - 69) / 12))
+        out[midi] = harmonic_score(spec, bin_hz, f0)
+    return out
+
+
 def estimate_pitch_hz(
     mono_slice: np.ndarray,
     sample_rate: int,
@@ -104,13 +184,6 @@ def estimate_pitch_hz(
     best_score = float(scores[best_idx])
     if best_score < 0.5:  # essentially no harmonic content
         return None
-
-    # Octave-down sanity check: if the half-frequency candidate scores at least
-    # 0.85 * best, prefer it (catches octave-up errors on borderline cases).
-    half_idx = best_idx - 1200  # one octave = 1200 cents
-    if half_idx >= 0 and scores[half_idx] >= 0.85 * best_score:
-        best_idx = half_idx
-        best_f0 = float(candidates[best_idx])
 
     return best_f0
 
