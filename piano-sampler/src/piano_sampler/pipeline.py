@@ -83,6 +83,11 @@ def _process_one(
     slice_scores = [score_midi_candidates(mono[s.start : s.end], sr, cfg=pitch_cfg) for s in slices]
     labels = label_slices(slice_scores)
 
+    # Per-group subfolder, e.g. "Long_Quiet_RR1", aids manual Kontakt mapping.
+    group_folder = f"{inp.articulation.capitalize()}_{inp.velocity.capitalize()}_RR{inp.rr}"
+    group_dir = sample_out_dir / group_folder
+    group_dir.mkdir(parents=True, exist_ok=True)
+
     written: list[str] = []
     regions: list[Region] = []
     notes_covered: list[int] = []
@@ -93,11 +98,12 @@ def _process_one(
         body = samples[sl.start : sl.end]
         body = apply_fades(body, sr, fade_cfg)
         name = midi_to_name(lbl.midi)
-        # Use MIDI number as primary id, note name as readability suffix.
-        fname = f"{lbl.midi:03d}_{name}_{inp.articulation}_{inp.velocity}_rr{inp.rr}.wav"
-        out_path = sample_out_dir / fname
+        # MIDI number as primary id (sorts correctly); note name for readability.
+        # Group folder already encodes articulation/velocity/RR.
+        fname = f"{lbl.midi:03d}_{name}.wav"
+        out_path = group_dir / fname
         write_wav(out_path, body, sr, bit_depth=24)
-        rel = f"{samples_relpath_prefix}{fname}"
+        rel = f"{samples_relpath_prefix}{group_folder}/{fname}"
         written.append(rel)
         notes_covered.append(lbl.midi)
         regions.append(
